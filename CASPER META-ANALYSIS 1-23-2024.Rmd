@@ -1,0 +1,1497 @@
+---
+title: "CASPER META ANALYSIS 9-20-2023"
+author: "Nicholas Cardamone"
+date: "9/20/2023"
+output: html_document
+---
+
+```{r}
+library(tidyverse)
+library(readxl)
+library(dplyr)
+library(ggplot2)
+library(stringr)
+library(dplyr)
+library(fuzzyjoin)
+library(gt)
+library(gtsummary)
+library(ggpubr)
+library(ggh4x)
+library(clubSandwich)
+library(metafor)
+
+library(lme4)
+
+
+setwd("C://Users//Nick//Documents//CASPER-Meta-analysis")
+study_characteristics <- read_xlsx("study_char_2024-01-24-16-26-20.xlsx") # Study / Strategy / Outcome
+sample_size <- read_xlsx("conds_2024-01-24-16-27-57.xlsx")  # Study / Outcome / Source
+icc_cov <- read_xlsx("icc_cov_2024-01-24-16-28-18.xlsx") # Study / Outcome / Source
+effect_size <- read_xlsx("eff_ss_2024-01-24-16-27-47.xlsx") # Study / Outcome / Source / Contrast
+```
+
+
+```{r, Data Preprocessing}
+### Only keep entries filled in by Nick
+# Remove irrelevant variables: e.g. all notes, comments, info: also collapse the analysis type variable. 
+study_characteristics <- study_characteristics %>% filter(str_detect(Characteristics_k, "Nick") == T) %>% dplyr::select(-ends_with("notes"), -ends_with("comment"), -ends_with("info"), -Level, -User)
+sample_size <- sample_size %>% filter(str_detect(Source_k, "Nick") == T) %>% dplyr::select(-ends_with("notes"), -ends_with("comment"), -ends_with("info"), -Level, -User)
+icc_cov <- icc_cov %>% filter(str_detect(Source_k, "Nick") == T) %>% dplyr::select(-ends_with("notes"), -ends_with("comment"), -ends_with("info"), -Level, -User) %>% tidyr::unite("analysis_type", c(analysis_type, measure_type_ep), sep= "_", remove = T, na.rm = T)
+effect_size <- effect_size %>% filter(str_detect(Source_k, "Nick") == T) %>% dplyr::select(-ends_with("notes"), -ends_with("comment"), -ends_with("info")) %>% tidyr::unite("analysis_type", c(analysis_type, measure_type_ep), sep= "_", remove = T, na.rm = T)
+
+# Remove "NR"
+study_characteristics[study_characteristics == "NR"] <- NA
+sample_size[sample_size == "NR"] <- NA
+icc_cov[icc_cov == "NR"] <- NA
+effect_size[effect_size == "NR"] <- NA
+```
+
+### Study Characteristics
+```{r, Outcomes and Study Metadata}
+outcomes <- study_characteristics %>% dplyr::select(Refid, Outcomes_k, dv_name, dv_outcome, dv_measure_approach, unfavorable_yes)
+# We're only taking variables at the study level for the implementation strategies and metadata datasets so
+
+imp_strategies <- study_characteristics %>% dplyr::select(Refid, IVs_k, imp1_name:control_target) %>% distinct() 
+metadata <- study_characteristics %>% dplyr::select(Refid:imps_rand_1) %>% distinct() 
+
+#Make dummy variables for randomization level
+
+metadata$rand_L1 <- if_else(str_detect(as.character(metadata$imps_rand_1), "1"), 1, 0)
+metadata$rand_L2 <- if_else(str_detect(as.character(metadata$imps_rand_1), "2"), 1, 0)
+metadata$rand_L3 <- if_else(str_detect(as.character(metadata$imps_rand_1), "3"), 1, 0)
+metadata$rand_L4 <- if_else(str_detect(as.character(metadata$imps_rand_1), "4"), 1, 0)
+```
+```{r, Implementation Strategies}
+# Pivot longer so that 1 row = 1 condition (nested within studies.)
+names <- imp_strategies %>% pivot_longer(cols = c("imp1_name", "imp2_name","imp3_name", "control_name"), names_to = "comparator", values_to = "name", names_pattern = "(.*)_name") %>% dplyr::select(Refid, IVs_k, comparator, name)
+eric <- imp_strategies %>% pivot_longer(cols = ends_with("eric"), names_to = "comparator", values_to = "strategies", names_pattern = "(.*)_eric") %>% dplyr::select(Refid, comparator, strategies)
+target <- imp_strategies %>% pivot_longer(cols = c("imp1_target", "imp2_target","imp3_target", "control_target"), names_to = "comparator", values_to = "target", names_pattern = "(.*)_target") %>% dplyr::select(Refid, comparator, target)
+
+# Mash the columns back together to make a tidied dataset for implementation strategies.
+
+imp_strategies <- data.frame(names, eric = eric$strategies, target = target$target)
+
+imp_strategies <- imp_strategies %>% filter(!is.na(name))
+
+imp_strategies$cond_num <- ave(imp_strategies$comparator, imp_strategies$Refid, FUN = seq_along)
+imp_strategies$target <- str_to_lower(imp_strategies$target)
+
+imp_strategies <- imp_strategies %>% separate(target, into = c("target1", "target2"), sep = ",")
+imp_strategies <- imp_strategies %>% separate(target1, into = c("target1", "target1_detail"), sep = " : ")
+imp_strategies <- imp_strategies %>% separate(target2, into = c("target2", "target2_detail"), sep = " : ")
+
+#** One row per study ** 
+imp_strategies_wide <- imp_strategies %>% dplyr::select(Refid, IVs_k, name, eric, target1, target2, cond_num) %>% pivot_wider(names_from = "cond_num", values_from = c("name", "eric", "target1", "target2"))
+```
+
+```{r, Sample Size}
+## Load sample size (Multiple sets of values per DV)
+sample_size <- sample_size %>% drop_na(data_source)
+
+#sample_size <- sample_size %>% filter(!is.na(cond_num) & !is.na(data_source))
+##### Pivot wider to have unique columns for sample size at each level.
+
+sample_size <- sample_size %>% drop_na(cond_num)
+sample_size <- sample_size %>% dplyr::select(Source_k, cond_num, L1_condition_N, L2_condition_N, L3_condition_N, L4_condition_N) #%>% 
+
+# Pivot wider 
+sample_size <- reshape(
+  merge(sample_size,
+        expand.grid(
+          Source_k = unique(sample_size$Source_k),
+          cond_num = 1:3
+        ),
+        all = TRUE
+  ),
+  direction = "wide",
+  idvar = "Source_k",
+  timevar = "cond_num"
+)
+
+```
+
+### ICC and COVARIATE R-SQ:
+```{r, ICC}
+# Fix ICC values:
+# If L1 variance and L2 variance are in the old L1/L2 variance fields, copy them onto the new fields.
+# Drop the + from the "+3" in the num_levels variable so it can be numeric.
+# From the PI provided data, just compute the ICC at each level from the VCEs so it's standardized, if it's from the paper leave it alone.
+icc_cov <- icc_cov %>% dplyr::mutate(L1_variance_3 = if_else(is.na(L1_variance_3), as.numeric(L1_variance_2), as.numeric(L1_variance_3)),
+                                     L2_variance_3 = if_else(is.na(L2_variance_3), as.numeric(L2_variance_2), as.numeric(L2_variance_3)),
+                                     num_levels = as.numeric(gsub("\\+", "", `num_levels`)),
+                                     ICC_2 = if_else(num_levels == 2 & data_source == "PI", as.numeric(L2_variance_3)/(as.numeric(L1_variance_3)+as.numeric(L2_variance_3)),
+                                                     if_else(num_levels == 3 & data_source == "PI", as.numeric(L2_variance_3)/(as.numeric(L1_variance_3)+as.numeric(L2_variance_3)+as.numeric(L3_variance_3)),
+                                                             if_else(num_levels == 4 & data_source == "PI", as.numeric(L2_variance_3)/(as.numeric(L1_variance_3)+as.numeric(L2_variance_3)+as.numeric(L3_variance_3)+as.numeric(L4_variance_3)), as.numeric(ICC_2)))),
+                                     ICC_3 = if_else(num_levels == 3 & data_source == "PI", as.numeric(L3_variance_3)/(as.numeric(L1_variance_3)+as.numeric(L2_variance_3)+as.numeric(L3_variance_3)),
+                                                     if_else(num_levels == 4 & data_source == "PI",
+                                                             as.numeric(L3_variance_3)/(as.numeric(L1_variance_3)+as.numeric(L2_variance_3)+as.numeric(L3_variance_3)+as.numeric(L4_variance_3)), as.numeric(ICC_3))),
+                                     ICC_4 = if_else(num_levels == 4 & data_source == "PI", as.numeric(L4_variance_3)/(as.numeric(L1_variance_3)+as.numeric(L2_variance_3)+as.numeric(L3_variance_3)+as.numeric(L4_variance_3)),
+                                                     as.numeric(ICC_4)))
+
+```
+
+```{r, Covariate R-squared}
+# Substitute null model VCE at each level if a value isn't already there.
+icc_cov <- icc_cov %>% dplyr::mutate(NULL_VCE = if_else(!is.na(NULL_VCE), as.numeric(NULL_VCE), 
+                                                        if_else(level_VCE == 1, as.numeric(L1_variance_3), 
+                                                                if_else(level_VCE == 2, as.numeric(L2_variance_3),
+                                                                        if_else(level_VCE == 3, as.numeric(L3_variance_3),
+                                                                                if_else(level_VCE == 4, as.numeric(L4_variance_3), NA))))))
+
+icc_cov <- icc_cov %>% dplyr::mutate(
+  pretest_covR = ( NULL_VCE -as.numeric( pretest_cov_VCE ))/ NULL_VCE,
+  demo_covR = ( NULL_VCE - as.numeric( demo_cov_VCE ))/ NULL_VCE,
+  demo_pretest_covR = ( NULL_VCE - as.numeric( demo_pretest_VCE ))/ NULL_VCE,
+
+  covR = ( NULL_VCE - as.numeric( full_VCE ))/ NULL_VCE)  ## Convert all negative values to 0.
+  #mutate(pretest_covR = if_else( pretest_covR > 0, pretest_covR, 0),
+ #        demo_covR = if_else( demo_covR >0, demo_covR, 0),
+  #       demo_pretest_covR = if_else( demo_pretest_covR >0, demo_pretest_covR, 0),
+
+   #      covR = if_else( covR >0, covR, 0)
+#  )
+
+cov <- icc_cov %>% dplyr::select(Source_k, level_VCE, NULL_VCE, demo_cov_VCE, pretest_cov_VCE, covR, demo_covR, demo_cov, pretest_covR, demo_pretest_covR, L1_variance_3, L2_variance_3, L3_variance_3, L4_variance_3, ICC_2, ICC_3, ICC_4) %>% pivot_wider(names_from = level_VCE, values_from = c(covR, demo_covR, demo_cov, pretest_covR, demo_pretest_covR))
+
+
+```
+
+###  Effect Size
+
+```{r, Effect Size}
+# Join effect_size and sample_size
+eff_ss <- left_join(effect_size, sample_size, "Source_k") %>% dplyr::select(-L1_variance_3, -L2_variance_3, -L3_variance_3, -L4_variance_3, -ICC_1, -ICC_2, -ICC_3, -ICC_4, -L1_variance_2, -L2_variance_2) %>% left_join(cov, "Source_k")
+
+# Drop rows with NA in d_contrast
+eff_ss <- eff_ss %>%
+  filter(!is.na(d_contrast))
+
+# Set contrast sample sizes
+eff_ss <- eff_ss %>%
+  mutate(
+    L1_condition_N_1 = if_else(d_contrast == "2v3", L1_condition_N.2, L1_condition_N.1),
+    L1_condition_N_2 = if_else(d_contrast == "1v2", L1_condition_N.2, L1_condition_N.3),
+    L2_condition_N_1 = if_else(d_contrast == "2v3", L2_condition_N.2, L2_condition_N.1),
+    L2_condition_N_2 = if_else(d_contrast == "1v2", L2_condition_N.2, L2_condition_N.3),
+    L3_condition_N_1 = if_else(d_contrast == "2v3", L3_condition_N.2, L3_condition_N.1),
+    L3_condition_N_2 = if_else(d_contrast == "1v2", L3_condition_N.2, L3_condition_N.3),
+    L4_condition_N_1 = if_else(d_contrast == "2v3", L4_condition_N.2, L4_condition_N.1),
+    L4_condition_N_2 = if_else(d_contrast == "1v2", L4_condition_N.2, L4_condition_N.3)
+  )
+
+# Time transformations
+eff_ss <- eff_ss %>%
+  mutate(
+    d_tp = as.numeric(d_tp),
+    num_timepoints = if_else(!is.na(num_timepoints_standard), as.numeric(num_timepoints_standard), 
+                                  if_else(!is.na(num_timepoints_nonstandard), as.numeric(num_timepoints_nonstandard), 
+                                          if_else(analysis_type != "long", 1, NA))),
+    duration = if_else(is.na(d_tp),
+      if_else(standard_time_interval == "Yes", as.numeric(measurement_interval_num) * (num_timepoints - 1),
+      if_else(num_timepoints == 2, as.numeric(gsub("[^0-9.-]", "", follow_up1)),
+              if_else(num_timepoints == 3, as.numeric(gsub("[^0-9.-]", "", follow_up2)),
+                      if_else(num_timepoints == 4, as.numeric(gsub("[^0-9.-]", "", follow_up3)), 3)))), NA),
+    duration = if_else(!is.na(d_tp),
+      if_else(standard_time_interval == "Yes", as.numeric(measurement_interval_num) * (d_tp - 1),
+      if_else(d_tp == 2, as.numeric(gsub("[^0-9.-]", "", follow_up1)),
+              if_else(d_tp == 3, as.numeric(gsub("[^0-9.-]", "", follow_up2)),
+                      if_else(d_tp == 4, as.numeric(gsub("[^0-9.-]", "", follow_up3)), 3)))), duration),
+    
+    follow_up1 = if_else(standard_time_interval == "Yes", as.numeric(measurement_interval_num),
+                         as.numeric(gsub("[^0-9.-]", "", follow_up1)))
+  )
+
+# Raw SD transformation
+eff_ss <- eff_ss %>%
+  mutate(
+    num_levels = as.numeric(gsub("\\+", "", `num_levels`)),
+    d_raw_SD = if_else(
+      !is.na(d_raw_SD),
+      as.numeric(d_raw_SD),
+      if_else(num_levels == 4,
+              sqrt(as.numeric(L1_variance_3) + as.numeric(L2_variance_3) + as.numeric(L3_variance_3) + as.numeric(L4_variance_3)),
+              if_else(num_levels == 3,
+                      sqrt(as.numeric(L1_variance_3) + as.numeric(L2_variance_3) + as.numeric(L3_variance_3)),
+                      if_else(num_levels == 2,
+                              sqrt(as.numeric(L1_variance_3) + as.numeric(L2_variance_3)), NA)))
+    ),
+    d_raw_SD = if_else(
+      !is.na(d_raw_SD),
+      d_raw_SD,
+      ((as.numeric(L1_condition_N_1) - 1) * as.numeric(c1_raw_sd_baseline) +
+       (as.numeric(L1_condition_N_2) - 2) * as.numeric(c2_raw_sd_baseline)) / 2
+    )
+  )
+
+# Effect size transformations
+eff_ss <- eff_ss %>%
+  mutate(
+    A = as.numeric(binary_success_tx),
+    C = as.numeric(binary_tx) - A,
+    B = as.numeric(binary_success_control),
+    D = as.numeric(binary_control) - B,
+    OR = (A * D) / (B * C),
+    d_binary = if_else(is.na(reg_coef), log(OR) * sqrt(3) / pi, as.numeric(reg_coef) * sqrt(3) / pi),
+    reg_coef_se = if_else(is.na(reg_coef_se), sqrt(1 / A + 1 / B + 1 / C + 1 / D), as.numeric(reg_coef_se)),
+    d_SMD = as.numeric(unsd_difference) / sqrt(as.numeric(L1_condition_N_1) * as.numeric(c1_raw_sd_baseline) + as.numeric(L1_condition_N_2) * as.numeric(c2_raw_sd_baseline)),
+    d_cont = as.numeric(reg_coef) / as.numeric(d_raw_SD),
+    
+    
+    d_long_cat = as.numeric(reg_coef_tx) / as.numeric(d_raw_SD), # coefficient constitutes change over entire time span and does not need to be multiplied by units of time.
+    
+    d_long_piecewise = 0.08, #if_else(d_tp == 2, as.numeric(reg_coef_tx) * follow_up1) / as.numeric(d_raw_SD), # if time 2, use Feingold's formula as normal.
+    
+    
+    d_long_linear = if_else(
+      measure_type_long == "long_binary",
+      log(exp(as.numeric(reg_coef_tx)) * as.numeric(duration) / as.numeric(d_raw_SD)) * sqrt(3) / pi, # Exponentiate b*time to get OR then convert to d (See Feingold 2013, p.117)
+      as.numeric(reg_coef_tx) * as.numeric(duration) / as.numeric(d_raw_SD)
+    ),
+    d_long_quadratic = ((as.numeric(reg_coef_tx) * as.numeric(duration)) + ((as.numeric(reg_coef_tx_q) * as.numeric(duration)^2))) / as.numeric(d_raw_SD),
+    d_author = as.numeric(gsub("[^0-9.-]", "", d_author)),
+    d_t_test = if_else(
+      d_CR_type == "t" & is.na(d_author),
+      as.numeric(d_CR) * sqrt((1 / as.numeric(L1_condition_N_1)) + (1/as.numeric(L1_condition_N_2))),
+      NA
+    ),
+    d_from_pval = if_else(
+      is.na(d_t_test) & is.na(d_author),
+      qt(as.numeric(gsub("[^0-9.-]", "", d_pval)) / 2, as.numeric(L1_condition_N_1) + as.numeric(L1_condition_N_2), lower.tail = FALSE) * sqrt(1 / as.numeric(L1_condition_N_1) + 1 / as.numeric(L1_condition_N_2)),
+      NA
+    )
+  )
+```
+
+
+```{r}
+# Components for variance estimates
+eff_ss <- eff_ss %>%
+  mutate(
+    analysis_type = if_else(analysis_type == "long", measure_type_long, analysis_type),
+    tot_v2 = if_else(num_levels == 2, as.numeric(L1_variance_3) + as.numeric(L2_variance_3), NA),
+    tot_v3 = if_else(num_levels == 3, as.numeric(L1_variance_3) + as.numeric(L2_variance_3) + as.numeric(L3_variance_3), NA),
+    tot_v4 = if_else(num_levels == 4, as.numeric(L1_variance_3) + as.numeric(L2_variance_3) + as.numeric(L3_variance_3) + as.numeric(L4_variance_3), NA),
+    L1_ss = if_else(is.na(L1_ss), as.numeric(L1_condition_N_1) + as.numeric(L1_condition_N_2), as.numeric(L1_ss)),
+    L2_ss = if_else(is.na(L2_ss), as.numeric(L2_condition_N_1) + as.numeric(L2_condition_N_2), as.numeric(L2_ss)),
+    L3_ss = if_else(is.na(L3_ss), as.numeric(L3_condition_N_1) + as.numeric(L3_condition_N_2), as.numeric(L3_ss)),
+    L4_ss = if_else(is.na(L4_ss), as.numeric(L4_condition_N_1) + as.numeric(L4_condition_N_2), as.numeric(L4_ss)),
+    vi_r2_1 = (4 * covR_1 * (1 - covR_1)^2) / L1_ss,
+    vi_r2_2 = (4 * covR_2 * (1 - covR_2)^2) / L2_ss,
+    vi_r2_3 = (4 * covR_3 * (1 - covR_3)^2) / L3_ss,
+    clus_1_2 = L1_ss / L2_ss,
+    clus_2_3 = L2_ss / L3_ss,
+    clus_3_4 = L3_ss / L4_ss,
+    v2 = as.numeric(L2_variance_3_se)^2,
+    v3 = as.numeric(L3_variance_3_se)^2,
+    v4 = as.numeric(L4_variance_3_se)^2,
+    vi_icc_2 = if_else(
+      num_levels == 2,
+      (2 * (1 - ICC_2)^2 * (1 + (clus_1_2 - 1) * ICC_2)^2) / (clus_1_2 * (clus_1_2 - 1) * (L2_ss - 1)),
+      if_else(
+        num_levels == 3,
+        (((clus_2_3 * (1 - ICC_2)^2 + 2 * ICC_2 * (1 - ICC_2)) * v2) / (clus_2_3 * tot_v3^2)) +
+          ((ICC_2^2 * v3) / tot_v3^2),
+        if_else(
+          num_levels == 4,
+          ((clus_3_4 * clus_2_3^2 * (1 - ICC_2)^2 + 2 * clus_3_4 * clus_2_3 * ICC_2 * (1 - ICC_2) + 2 * ICC_2^2) * v2) /
+            (clus_3_4 * clus_2_3^2 * tot_v4^2) +
+            ((clus_3_4 - 2) * ICC_2^2 * v3) / (clus_3_4 * tot_v4^2) +
+            (ICC_2^2 * v4) / tot_v4^2,
+          NA
+        )
+      )
+    ),
+    vi_icc_3 = if_else(
+      num_levels == 3,
+      (((clus_2_3 * (ICC_3)^2 + 2 * ICC_3 * (1 - ICC_3)) * v2) / (clus_2_3 * tot_v3^2)) +
+        (((1 - ICC_3)^2 * v3) / tot_v3^2),
+      if_else(
+        num_levels == 4,
+        (((clus_3_4 * clus_2_3^2 * ICC_3^2 + 2 * (clus_3_4 * clus_2_3 - 1) * ICC_3 * (1 - ICC_3)) * v2) / (clus_3_4 * clus_2_3^2 * tot_v4^2)) +
+          ((((clus_3_4 * (1 - ICC_3)^2) + (2 * ICC_3 * (1 - ICC_3))) * v3) / (clus_3_4 * tot_v4^2)) +
+          ((ICC_3^2 * v4) / tot_v4^2),
+        NA
+      )
+    ),
+    vi_icc_4 = if_else(
+      num_levels == 4,
+      (((clus_3_4 * clus_2_3 * (clus_2_3 - 2) * ICC_4^2 - 2 * ICC_4 * (1 - ICC_4)) * v2) / (clus_3_4 * clus_2_3^2 * tot_v4^2)) +
+        (((clus_3_4 * ICC_4^2 + 2 * ICC_4 * (1 - ICC_4)) * v3) / (clus_3_4 * tot_v4^2)) +
+        ((1 - ICC_4)^2 * v4) / tot_v4^2,
+      NA
+    )
+  )
+
+# Pivot longer to create effect size parameter components
+eff_ss_long <- eff_ss %>%
+  pivot_longer(
+    c("d_author", "d_binary", "d_cont", "d_SMD", "d_long_piecewise", "d_long_cat", "d_long_linear", "d_long_quadratic", "d_t_test", "d_from_pval"),
+    names_to = "dtype",
+    values_to = "dval"
+  ) %>%
+  mutate(
+    analysis_match = case_when(
+      dtype == "d_cont" & analysis_type == "ep_cont" ~ 1,
+      dtype == "d_SMD" & analysis_type == "ep_cont" ~ 1,
+      dtype == "d_binary" & analysis_type == "ep_binary" ~ 1,
+      dtype == "d_long_cat" & time_modeled == "cat" ~ 1,
+      dtype == "d_long_piecewise" & time_modeled == "piecewise" ~ 1,
+      dtype == "d_long_linear" & time_modeled == "linear" ~ 1,
+      dtype == "d_long_quadratic" & time_modeled == "quad" ~ 1,
+      dtype == "d_author" & data_source == "Paper" ~ 1,
+      dtype == "d_from_pval" & analysis_type == "ep_cont" & data_source == "Paper" ~ 1,
+      dtype == "d_t_test" & analysis_type == "ep_cont" & data_source == "Paper" ~ 1,
+      TRUE ~ 0
+    ),
+    longitudinal = if_else(!is.na(time_modeled), 1, 0),
+    num_levels = as.numeric(gsub("\\+", "", `num_levels`)),
+    vi = case_when(
+      dtype == "d_cont" & num_levels == 2 ~ (as.numeric(reg_coef_se)^2 / tot_v2) + (as.numeric(reg_coef)^2 * as.numeric(L2_variance_3_se)^2) / (4 * (tot_v2)^3),
+      dtype == "d_cont" & num_levels == 3 ~ (as.numeric(reg_coef_se)^2 / tot_v3) + (as.numeric(reg_coef)^2 * (as.numeric(L2_variance_3_se)^2 + as.numeric(L3_variance_3_se)^2)) / (4 * tot_v3^3),
+      dtype == "d_cont" & num_levels == 4 ~ (as.numeric(reg_coef_se)^2 / tot_v4) + (as.numeric(reg_coef)^2 * (as.numeric(L2_variance_3_se)^2 + as.numeric(L3_variance_3_se)^2 + as.numeric(L4_variance_3_se)^2)) / (4 * tot_v4^3),
+      longitudinal == 1 & !is.na(reg_coef_tx_se) ~ as.numeric(reg_coef_tx_se)^2 * (as.numeric(dval) / as.numeric(reg_coef_tx))^2,
+      longitudinal == 1 & is.na(reg_coef_tx_se) ~ L1_ss / (as.numeric(L1_condition_N_1) * as.numeric(L1_condition_N_2)) + (dval^2) / (2 * L1_ss),
+      dtype == "d_binary" ~ 3 * as.numeric(reg_coef_se)^2 / pi^2,
+      dtype == "d_author" ~ (as.numeric(effect_size_upperbound) - as.numeric(effect_size_lowerbound)) / 3.92,
+      TRUE ~ NA_real_
+    )
+  ) %>%
+  filter(analysis_match == 1)
+
+```
+
+
+```{r, Further Dataset Cleaning; ICC and Covariate R-Square}
+# Initial data processing
+# Join datasets
+icc_cov_meta <- eff_ss %>%
+  separate(col = Source_k, into = c("study", "determinant", "dv_name"), sep = "\\|") %>% 
+  left_join(outcomes, by = c("Refid", "dv_name"))
+
+metadata2 <-metadata %>%
+  dplyr::select(Refid, -Author, -Year, hybrid_type:rand_L4)
+
+icc_cov_meta <- left_join(icc_cov_meta, metadata2, by = "Refid")
+
+# Handle missing names
+icc_cov_meta <- icc_cov_meta %>%
+  mutate(
+    L1_name = if_else(is.na(L1_name), L1_analysis_name, L1_name),
+    L2_name = if_else(is.na(L2_name), L2_analysis_name, L2_name),
+    L3_name = if_else(is.na(L3_name), L3_analysis_name, L3_name),
+    L4_name = L4_analysis_name,
+    longitudinal = if_else(str_detect(analysis_type, "long"), 1, 0)
+  )
+
+cov_meta_pi <- icc_cov_meta %>% filter(data_source == "PI") %>% distinct() %>% mutate(covR_1 = if_else(covR_1 ==1, 0, covR_1),
+                                                                                      covR_2 = if_else(covR_2 ==1, 0, covR_2),
+                                                                                      covR_3 = if_else(covR_3 ==1, 0, covR_3))
+# Split covariate r-squared levels into separate dataframes
+meta_r2_L1 <- cov_meta_pi %>% filter(!is.na(covR_1)) %>% mutate(full_est = covR_1, var = "Cov R-sq", type = "Level 1", covariate = demo_cov_1, demo_est = demo_covR_1, pretest_est = pretest_covR_1, demo_pretest_est = demo_pretest_covR_1)
+meta_r2_L2 <- cov_meta_pi %>% filter(!is.na(covR_2)) %>% mutate(full_est = covR_2, var = "Cov R-sq", type = "Level 2", covariate = demo_cov_2, demo_est = demo_covR_2, pretest_est = pretest_covR_2, demo_pretest_est = demo_pretest_covR_2)
+meta_r2_L3 <- cov_meta_pi %>% filter(!is.na(covR_3)) %>% mutate(full_est = covR_3, var = "Cov R-sq", type = "Level 3", covariate = demo_cov_3, demo_est = demo_covR_3, pretest_est = pretest_covR_3, demo_pretest_est = demo_pretest_covR_3)
+
+# Subset for data_source == "PI"
+icc_meta_pi <- icc_cov_meta %>%
+  filter(data_source == "PI") %>%
+  distinct()
+
+# Handle ICC data
+icc_dig_in <- icc_meta_pi %>%
+  pivot_longer(
+    cols = c(ICC_2, ICC_3, ICC_4),
+    names_to = "level_ICC",
+    values_to = "ICC"
+  ) %>%
+  mutate(
+    analysis_index = paste0(longitudinal, num_levels, level_ICC),
+    cluster_level = if_else(level_ICC == "ICC_2", L2_name, if_else(level_ICC == "ICC_3", L3_name, NA)),
+    ICC_vi = if_else(
+      level_ICC == "ICC_2", vi_icc_2,
+      if_else(level_ICC == "ICC_3", vi_icc_3,
+              if_else(level_ICC == "ICC_4", vi_icc_4, NA))
+    )
+  )
+
+# Create datasets based on level conditions
+icc_cov_meta_pi_L2 <- icc_dig_in %>%
+  filter(
+    analysis_index %in% c("14ICC_3", "13ICC_3", "03ICC_2", "02ICC_2") &
+    !is.na(ICC)
+  ) %>% mutate(est= ICC, vi = ICC_vi, var = "ICC", type = "Between-units at level 2")
+
+icc_cov_meta_pi_L3 <- icc_dig_in %>%
+  filter(
+    analysis_index %in% c("14ICC_4", "03ICC_3") &
+    !is.na(ICC) 
+  ) %>% mutate(est= ICC, vi = ICC_vi, var = "ICC", type = "Between-units at level 3")
+
+icc_cov_meta_pi_long <- icc_dig_in %>%
+  filter(
+    analysis_index %in% c("14ICC_2", "13ICC_2", "12ICC_2") &
+    !is.na(ICC)
+  ) %>% mutate(est= ICC, vi = ICC_vi, var = "ICC", type = "Longitudinal (Within-unit)")
+
+```
+```{r, Further Data Cleaning: Effect Size}
+# Process d values
+d_meta <- eff_ss_long %>% separate(col = Source_k, into = c("study", "determinant", "dv_name", "dv_source"), sep = "\\|") %>% dplyr::select(-dv_source)
+
+d_meta <- left_join(d_meta, outcomes, c("Refid", "dv_name"))
+
+## Create a variable that identifies if the calculated d value aligns with the analysis conducted.
+# Keep first time point
+
+d_meta <- d_meta %>% dplyr::select(-Title, -Year, -Author) %>% mutate(d_tp = if_else(is.na(d_tp), 1, as.numeric(d_tp)),
+                                                               d_adj = if_else(is.na(d_adj), "unadj", d_adj),
+                                                               d_adj = if_else(d_adj == "unadj", 0, 1),
+                                                               PI_sourced = if_else(data_source == "PI", 1, 0),
+                                                               unfavorable_yes = ifelse(is.na(unfavorable_yes), 0, unfavorable_yes),
+                                                               dval = if_else(unfavorable_yes == 1, dval*-1, dval),
+                                                               dval = dval, 4) 
+
+
+```
+
+```{r, Adjusted vs. Unadjusted Effect Size}
+# Adjusted vs. unadjusted effect size comparison
+adj_unadj <- d_meta %>% group_by(dv_name, d_contrast, d_adj, d_tp) %>% drop_na(dval) %>% slice_min(d_tp, with_ties = T) %>% dplyr::select(data_source, dv_name, d_contrast, dtype, dval, d_tp, d_adj) %>% mutate(count = n()) %>% filter(count > 1) %>% ungroup()
+
+
+adj_unadj <- adj_unadj %>% distinct() %>% mutate(dval = round(dval, 2)) %>% dplyr::select(-count) %>% group_by(data_source, dv_name, d_contrast, dtype, d_adj) %>% pivot_wider(names_from = c("data_source", "d_adj"), values_from = c("dval"))# %>% mutate_all( ~replace(., lengths(.)==0, NA))# %>% mutate(across(3:6, round, 3))
+
+knitr::kable( adj_unadj )
+```
+
+```{r, Join Datasets}
+d_meta <- left_join(d_meta, metadata, "Refid")
+d_meta <- left_join(d_meta, imp_strategies_wide, c("Refid", "IVs_k"))
+
+d_meta <- d_meta %>% 
+  mutate(L1_name = if_else(is.na(L1_name), L1_analysis_name, L1_name),
+         L2_name= if_else(is.na(L2_name), L2_analysis_name, L2_name),
+         L3_name= if_else(is.na(L3_name), L3_analysis_name, L3_name),
+         L4_name= L4_analysis_name) 
+```
+
+```{r}
+d_cov <- d_meta %>% 
+  #filter(d_adj == 0 | dtype == "d_author") %>% 
+  group_by(dv_name, d_contrast, d_adj, d_tp) %>% 
+  drop_na(dval) %>% slice_min(d_tp, with_ties = T) %>% 
+  dplyr::select(data_source, dv_name, d_contrast, dtype, dval, d_tp, d_adj) %>% 
+  mutate(count = n()) %>% 
+ # filter(count > 1) %>% 
+  ungroup() %>% 
+  distinct() %>% 
+  mutate(dval = round(dval, 2)) %>% 
+  dplyr::select(-count) %>% 
+  group_by(data_source, dv_name, d_contrast, dtype, d_adj) %>% pivot_wider(names_from = "d_adj", values_from = "dval")
+
+```
+
+
+```{r, Reserve data for timepoint analysis}
+d_long <- d_meta %>% group_by(data_source, dv_name, d_contrast, d_tp) %>% 
+  drop_na(dval) %>% 
+  group_by(data_source, dv_name, d_contrast, d_tp) %>% 
+  slice_min(d_adj, with_ties = F) %>% group_by(Refid, dv_name, d_contrast) %>% slice_max(PI_sourced) %>% ungroup()
+```
+
+### Analysis
+
+```{r}
+
+d_meta <- d_meta %>% mutate(prim_name = if_else(d_contrast == "1v2" | d_contrast == "1v3" | d_contrast == "1v4", name_1, 
+                                                if_else(d_contrast == "2v3" | d_contrast == "2v4", name_2, name_3)),
+                            comparator_name = if_else(d_contrast == "1v4" | d_contrast == "2v4" | d_contrast == "3v4", name_4, 
+                                                if_else(d_contrast == "1v3" | d_contrast == "2v3", name_3, name_2)), 
+                            prim_eric = if_else(d_contrast == "1v2" | d_contrast == "1v3" | d_contrast == "1v4", eric_1, 
+                                                if_else(d_contrast == "2v3" | d_contrast == "2v4", eric_2, eric_3)),
+                            comparator_eric = if_else(d_contrast == "1v4" | d_contrast == "2v4" | d_contrast == "3v4", eric_4, 
+                                                if_else(d_contrast == "1v3" | d_contrast == "2v3", eric_3, eric_2)),
+                            prim_target1 = if_else(d_contrast == "1v2" | d_contrast == "1v3" | d_contrast == "1v4", target1_1, 
+                                                if_else(d_contrast == "2v3" | d_contrast == "2v4", target1_2, target1_3)),
+                            comparator_target1 = if_else(d_contrast == "1v4" | d_contrast == "2v4" | d_contrast == "3v4", target1_4, 
+                                                         if_else(d_contrast == "1v3" | d_contrast == "2v3", target1_3, target1_2)),
+                            prim_target2 = if_else(d_contrast == "1v2" | d_contrast == "1v3" | d_contrast == "1v4", target2_1,
+                                                   if_else(d_contrast == "2v3" | d_contrast == "2v4", target2_2, target2_3)),
+                            comparator_target2 = if_else(d_contrast == "1v4" | d_contrast == "2v4" | d_contrast == "3v4", target2_4,
+                                                         if_else(d_contrast == "1v3" | d_contrast == "2v3", target2_3, target2_2)))
+
+# Subtract implementation strategies from each other.
+d_meta <- d_meta %>%
+    mutate(
+        prim_subtracted = map2(
+            str_split(prim_eric, ","),
+            str_split(comparator_eric, ","),
+            ~ setdiff(.x, .y)
+        ) %>% map_chr(~ paste0(.x, collapse = ";")) %>% str_trim(),
+        comparator_subtracted = map2(
+            str_split(comparator_eric, ","),
+            str_split(prim_eric, ","),
+            ~ setdiff(.x, .y)
+        ) %>% map_chr(~ paste0(.x, collapse = ";")) %>% str_trim(),
+        comparator_subtracted = if_else(comparator_subtracted == "NA", "Service as usual", comparator_subtracted),
+        effect_size_type = if_else(comparator_subtracted == "Service as usual", "Service as usual",
+                                   if_else(comparator_subtracted == "" | prim_subtracted == "", "Enhanced vs. Standard", "Comparative Effectiveness")) 
+    ) %>% mutate(effect_size_type = if_else(effect_size_type == "Enhanced vs. Standard" & Refid %in% c(31302525, 28425735), "Comparative Effectiveness", effect_size_type)) %>% dplyr::select(-ends_with("N.1"), -ends_with("N.2"), -ends_with("N.3"), -ends_with("N.4"), -IVs_k, -Outcomes_k, -starts_with("vi_r"), -starts_with("ICC"), -starts_with("demo_"), -starts_with("pretest_"), -starts_with("covR"))
+
+d_meta <- d_meta %>% 
+  group_by(data_source, dv_name, d_contrast, dtype) %>% 
+  slice_min(d_tp, with_ties = T) %>% 
+  slice_min(d_adj, with_ties = F)
+```
+
+
+```{r, Make Effect Size Subgroups}
+d_final <- d_meta %>% group_by(Refid, dv_name, d_contrast) %>% slice_max(PI_sourced) %>% filter(!is.na(dval))
+
+meta_d_service_as_usual <- d_final %>%
+  filter(effect_size_type == "Service as usual") %>%
+  mutate(Refid, est= dval, vi = vi, var = "Effect size", type = "Standard vs. Standard + Enhanced")
+
+meta_d_enhancedvstandard <- d_final %>%
+  filter(effect_size_type == "Enhanced vs. Standard") %>% 
+  mutate(Refid, est= dval, vi =vi, var = "Effect size", type = "Standard vs. Standard + Enhanced")
+
+meta_d_compeff <- d_final %>%
+  filter(effect_size_type == "Comparative Effectiveness") %>% 
+  mutate(est= dval, vi = vi, var = "Effect size", type = "Comparative effectiveness") 
+
+```
+
+
+### Final Data Cleaning:
+
+```{r, Tidy Data}
+meta_d_final <- rbind.data.frame(meta_d_service_as_usual, meta_d_enhancedvstandard, meta_d_compeff)
+meta_r2_final <- rbind.data.frame(meta_r2_L1, meta_r2_L2, meta_r2_L3)
+meta_icc_final <- rbind.data.frame(icc_cov_meta_pi_L2, icc_cov_meta_pi_L3, icc_cov_meta_pi_long)
+
+imp_out <- c("adoption", "penetration", "fidelity", "sustainment", "other")
+
+clean_outcome_vals <- function(data){
+ data <- data %>% ungroup() %>% 
+   mutate(`Outcome Type` = if_else(dv_outcome %in% imp_out, "Implementation", "Clinical"),
+          `Outcome Subtype` = if_else(dv_outcome == "adoption", "Adoption",
+                              if_else(dv_outcome == "penetration", "Reach",
+                              if_else(dv_outcome == "symptoms", "Symptoms",
+                              if_else(dv_outcome == "functioning", "Functioning",
+                              if_else(dv_outcome == "fidelity", "Fidelity", 
+                              if_else(dv_outcome == "other", "Other implementation outcome", "Sustainment")))))),
+          `Measurement Approach` = if_else(dv_measure_approach == "caregiver" | dv_measure_approach == "participant", "Patient or caregiver report",
+                        if_else(dv_measure_approach == "provider", "Provider report",
+                        if_else(dv_measure_approach == "chart review" | dv_measure_approach == "metadata" | dv_measure_approach == "dv_measure_approach" | dv_measure_approach == "Research team rated based on data provided by site"| dv_measure_approach == "observer_coded", "External observation", "other"))))
+ return(data)
+}
+
+meta_d_final <- meta_d_final %>% clean_outcome_vals() %>% dplyr::select(Author,Refid, Year, data_source, dv_name, d_contrast, `Outcome Type`, `Outcome Subtype`, `Measurement Approach`, intervention_target, L1_name, L2_name, L3_name, L4_name, L1_ss, L2_ss, L3_ss, L4_ss, clus_1_2, clus_2_3, clus_3_4, est, vi, var, type, duration, interval_unit, num_timepoints, longitudinal, prim_subtracted, comparator_subtracted, num_levels) %>% filter(!is.na(est)) %>% distinct() %>% arrange(Author, dv_name, d_contrast)
+
+meta_r2_final <- meta_r2_final %>% clean_outcome_vals() %>% dplyr::select(Author,Refid, Year, data_source, dv_name, `Outcome Type`, `Outcome Subtype`, `Measurement Approach`, num_levels, L1_name, L2_name, L3_name, L4_name, intervention_target, L1_ss, L2_ss, dv_name, L1_variance_3, L2_variance_3, L3_variance_3, L4_variance_3, covariate, NULL_VCE, demo_cov_VCE, pretest_cov_VCE,  demo_est, pretest_est, demo_pretest_est, full_est, var, type, num_timepoints, longitudinal) %>% distinct() %>% arrange(Author, dv_name)
+
+meta_icc_final <- meta_icc_final %>% clean_outcome_vals() %>% dplyr::select(Author,Refid, Year, data_source, dv_name, `Outcome Type`, `Outcome Subtype`, `Measurement Approach`, num_levels, L1_name, L2_name, L3_name, L4_name, intervention_target, L1_ss, L2_ss, dv_name, L1_variance_3, L2_variance_3, L3_variance_3, L4_variance_3, est, vi, var, type, num_timepoints, longitudinal) %>% distinct() %>% arrange(Author, dv_name)
+
+```
+
+```{r}
+# Flip signs (and conditions)if the comparison condition has a strategy and the primary condition doesn't.
+meta_d_final <- meta_d_final %>% mutate(est = if_else(type == "Comparative effectiveness" & est <0, est*-1, est))
+
+meta_d_final <- transform(meta_d_final, prim_subtracted = ifelse(type == "Comparative effectiveness" & est <0, comparator_subtracted, prim_subtracted), comparator_subtracted = ifelse(type == "Comparative effectiveness" & est <0, prim_subtracted, comparator_subtracted))
+
+meta_d_final <- meta_d_final %>% mutate(prim_strategy_count = str_count(prim_subtracted, ";")+1, comparator_strategy_count = if_else(comparator_subtracted %in% c("", "Standard vs. Standard + Enhanced"), 0, str_count(comparator_subtracted, ";")+1), strat_diff = prim_strategy_count - comparator_strategy_count)
+```
+
+```{r}
+sample_size_tb <- meta_d_final %>% 
+  select(Refid, dv_name, L1_name, L1_ss, L2_name, L2_ss, L3_name, L3_ss, L4_name, L4_ss, clus_1_2, clus_2_3, clus_3_4,num_levels, longitudinal) %>% 
+  group_by(Refid, num_levels, longitudinal) %>% 
+  summarise(clus_1_2 = mean(clus_1_2, na.rm = T), clus_2_3 = mean(clus_2_3, na.rm = T), clus_3_4 = mean(clus_3_4, na.rm = T), n = 1)
+                                                                                                                                    sample_size_tb <- sample_size_tb %>% group_by(num_levels, longitudinal) %>% dplyr::summarize(clus_1_2 = mean(clus_1_2, na.rm = T), clus_2_3 = mean(clus_2_3, na.rm = T), clus_3_4 = mean(clus_3_4, na.rm = T), 
+                                                                                                  studies = sum(n))    
+#sample_size_tb <- sample_size_tb %>% mutate_all(~ifelse(is.nan(.), NA, .))
+
+#sample_size_tb <- sample_size_tb %>%
+#  mutate(across(everything(), as.character))
+
+```
+
+
+### Study Characteristics Analysis
+```{r, Table 1, eval = F, error = F}
+study_char_collapse <- study_characteristics %>% mutate(Author = str_sub(Author, 1, 10)) %>% 
+  unite("Conditions", c(imp1_name, imp2_name, imp3_name, control_name), sep = "; ", remove = T) %>% 
+  unite("ERIC Strategies", c(imp1_eric, imp2_eric, imp3_eric, control_eric), sep = "; ", remove = T) %>% 
+  group_by(Refid, Author, Year, intervention_name, clustering_type, `ERIC Strategies`, Conditions) %>% dplyr::summarize(
+                                                            `DV Name` = paste(dv_name, collapse='; '),
+                                                            `Outcomes` = paste(str_to_title(dv_outcome), collapse='; '),
+                                                            `Measurement Approach`= paste(str_to_title(dv_measure_approach),collapse='; '))
+
+
+
+study_char_collapse[] <- lapply(study_char_collapse, gsub, pattern=' NA;', replacement='') 
+
+
+#eric_cat <- readxl::read_xlsx("cat-strat-ERIC-list.xlsx")
+
+#imp_strategies_wide$strats <- paste(imp_strategies_wide$eric_1, imp_strategies_wide$eric_2, imp_strategies_wide$eric_3, imp_strategies_wide$eric_4, sep = ";") 
+
+#strat_cat_match <- imp_strategies_wide %>% fuzzy_inner_join(eric_cat, by = c("strats" = "strat"), str_detect) %>% dplyr::count(Refid, cat)
+
+#authors <- metadata %>% dplyr::select(Refid, Author)
+#strat_join <- left_join(strat_cat_match, authors, c("Refid"))
+
+#strat_join <- strat_join %>%
+ # group_by(Refid, Author) %>%
+#  dplyr::summarise(cat = str_c(cat, collapse = "; ")) %>%
+  #ungroup()
+
+#strat_join$`ERIC Category` <- strat_join$cat
+#strat_join$Refid <- as.character(strat_join$Refid)
+
+#study_char_collapse <- left_join(study_char_collapse, strat_join, by = "Refid")
+
+#gt( study_char_collapse )
+
+#write.csv(study_char_collapse, "C://Users//Nick//Downloads//study_char_collapse.csv")
+```
+
+### ERIC Strategies
+```{r, ERIC Strategy Table, eval = FALSE, include=FALSE}
+library(gt)
+imp_strategies_wide$strats <- paste(imp_strategies_wide$eric_1, imp_strategies_wide$eric_2, imp_strategies_wide$eric_3, imp_strategies_wide$eric_4, sep = ";") 
+
+#category_count <- imp_strategies_wide %>% 
+#  fuzzy_inner_join(eric_cat, by = c("strats" = "strat"), str_detect) %>% 
+#  group_by(Refid, cat) %>% 
+#  dplyr::summarize(count = n_distinct(cat)) %>% group_by(cat) %>% 
+#dplyr::summarize(frequency = paste(n(), '(', sprintf(fmt = '%.0f%%', as.numeric(n()/17) *100 ), ')'))
+
+#gt( category_count )
+
+#strategy_count <- imp_strategies_wide %>% 
+#  fuzzy_inner_join(eric_cat, by = c("strats" = "strat"), str_detect) %>% 
+#  group_by(Refid, cat, strat) %>% 
+#  dplyr::summarize(count = n_distinct(strat)) %>% group_by(cat, strat) %>% 
+#  dplyr::summarize(frequency = paste(n(), '(', sprintf(fmt = '%.0f%%', as.numeric(n()/17) *100 ), ')'))
+
+#gt( strategy_count, groupname_col = "cat" )
+
+#write.csv(imp_strategies_viz, "/Users/nickcardamone/Downloads/imp_strategies_viz.csv")
+```
+
+```{r, Full ERIC Contrasts}
+#ERIC_contrasts =gt( imp_strategies, groupname_col = "Refid" )
+
+#write.csv(ERIC_contrasts, "imp_strategies_viz.csv")
+
+```
+```{r, Outcomes Table}
+
+
+library(gt)
+
+# Out of all outcomes
+
+category_count <- meta_d_final %>% dplyr::select(Refid, dv_name, Outcome.Type) %>% distinct() %>% 
+  group_by(Outcome.Type) %>% 
+  dplyr::summarize(frequency = paste(n(), '(', sprintf(fmt = '%.0f%%', as.numeric(n()/53) *100 ), ')'))
+
+gt( category_count )
+
+
+subcategory_count <- meta_d_final %>% dplyr::select(Refid, dv_name, Outcome.Subtype) %>% distinct() %>% 
+  group_by(Outcome.Subtype) %>% 
+  dplyr::summarize(frequency = paste(n(), '(', sprintf(fmt = '%.0f%%', as.numeric(n()/53) *100 ), ')'))
+
+gt( subcategory_count )
+
+measurement_count <- meta_d_final %>% dplyr::select(Refid, dv_name, Measurement.Approach) %>% distinct() %>% 
+  group_by(Measurement.Approach) %>% 
+  dplyr::summarize(frequency = paste(n(), '(', sprintf(fmt = '%.0f%%', as.numeric(n()/53) *100 ), ')'))
+
+gt( measurement_count )
+
+# By outcome type
+
+measurement_outcometype_count <- meta_d_final %>% dplyr::select(Refid, dv_name, Outcome.Type, Measurement.Approach) %>% distinct() %>% 
+  group_by(Outcome.Type, Measurement.Approach) %>% 
+  dplyr::summarize(frequency = n())
+
+gt( measurement_outcometype_count )
+
+
+#write.csv(imp_strategies_viz, "/Users/nickcardamone/Downloads/imp_strategies_viz.csv")
+```
+
+
+
+```{r, Strategies per Condition & Data Source Distribution}
+imp_strategies %>% dplyr::select(Refid, cond_num) %>% distinct() %>% group_by(Refid) %>% dplyr::summarize(conds=max(cond_num)) %>% summarize(mean = mean(as.numeric(conds)), SD = sd(conds), min = min(conds), max = max(conds))
+
+meta_d_final %>% 
+  mutate(stud_var = paste0(Refid, dv_name)) %>% group_by(data_source) %>% dplyr::summarize(n=n(),     
+                                                            n_outcomes = n_distinct(stud_var))
+
+meta_d_final %>% 
+  dplyr::select(Refid, dv_name) %>% 
+  distinct() %>% 
+  group_by(Refid) %>% dplyr::summarize(n=n()) %>% dplyr::summarize(mean = mean(n), sd = sd(n))
+
+
+```
+
+### Parameter Descriptive Statistics
+
+
+
+
+
+```{r, ICC Summary Stats}
+group_by(meta_icc_final,  type) %>%
+  dplyr::summarise(
+    count = n(),
+    median = median(est, na.rm = TRUE),
+    prct25 = quantile(est, probs = c(0.25)),
+    prct75 = quantile(est, probs = c(0.75)),
+    IQR = IQR(est, na.rm = TRUE)
+  )
+
+
+meta_icc_final %>% group_by(type) %>% dplyr::select(est) %>% tbl_summary()
+
+
+
+meta_icc_final <- meta_icc_final %>% mutate(cluster = if_else(type == "Longitudinal (Within-unit)", L2_name, 
+                                                              if_else(type == "Between-units at level 2"  & longitudinal == 1, L3_name,
+                                                                      if_else(type == "Between-units at level 3" & longitudinal == 1, L4_name,
+                                                                              if_else(type == "Between-units at level 2"  & longitudinal == 0, L2_name,
+                                                                                    if_else(type == "Between-units at level 3" & longitudinal == 0, L3_name, NA))))),
+                                            cluster = if_else(cluster == "patient", "patients", cluster),
+                                            cluster = if_else(cluster == "agency", "site", cluster))
+
+
+```
+
+```{r ICC Boxplot}
+library(extrafont)
+#font_import()
+#loadfonts(device = "win")
+
+meta_icc_final$type <- factor(meta_icc_final$type,
+    levels = c('Longitudinal (Within-unit)', 'Between-units at level 2','Between-units at level 3'), ordered = TRUE)
+
+meta_icc_final$type2 <- if_else(meta_icc_final$type == 'Longitudinal (Within-unit)', "Within-unit",
+                                if_else(meta_icc_final$type == 'Between-units at level 2', "Between-units (L2)", "Between-units (L3)"))
+
+meta_icc_final$order <- if_else(meta_icc_final$type == 'Longitudinal (Within-unit)', 1,
+                                if_else(meta_icc_final$type == 'Between-units at level 2', 2, 3))
+
+t1 <- "Longitudinal (L2) ρL" 
+t2 <- "Cross-sectional (L2) ρC2" 
+t3 <- "Cross-sectional (L3) ρC3"
+
+meta_icc_final$type2 <- if_else(meta_icc_final$type == 'Longitudinal (Within-unit)', t1,
+                                if_else(meta_icc_final$type == 'Between-units at level 2', t2, t3))
+
+meta_icc_final_plt <- meta_icc_final
+
+
+#meta_icc_final_plt$type2 <- factor(meta_icc_final_plt$type2,
+#    levels = c(starts_with('Longitudinal'), starts_with('Cross-sectional (L2)'), starts_with('Cross-sectional (L3)')), ordered = F)
+
+#my_comparisons <- list( c("Longitudinal", "Cross-sectional (L2)"), c("Cross-sectional (L2)", "Cross-sectional (L3)"), c("Longitudinal", "Cross-sectional (L3)") )
+
+bplot2 <- ggplot(meta_icc_final_plt, aes(x = fct_reorder(type2, order), y = est)) + geom_boxplot()  + geom_hline(yintercept=0, alpha=0.5, linetype = "dashed")+ geom_jitter(width = .32, shape=18, size = 4, alpha = .75) + coord_flip() + scale_y_continuous(breaks = seq(0, .8, by = .1)) + theme_pubr(base_size = 20) + theme(
+        text = element_text(family = "Gill Sans MT")
+    ) + rremove("legend") + xlab("")+ ylab("ICC") # Add significance levels
+ # stat_compare_means(comparisons = my_comparisons, label = "p.signif", size = 10) 
+bplot2
+
+ggsave("icc_boxplot12-18.png", bplot2, height = 9, width = 14)
+```
+```{r, Effect Size Boxplot}
+group_by(meta_d_final,  type) %>% 
+  mutate(stud_var = paste0(Refid, dv_name)) %>%
+  dplyr::summarise(
+    count = n(),
+    n_outcomes = n_distinct(stud_var),
+    median = median(est, na.rm = TRUE),
+    prct25 = quantile(est, probs = c(0.25)),
+    prct75 = quantile(est, probs = c(0.75)),
+    IQR = IQR(est, na.rm = TRUE)
+  ) %>% gt()
+
+
+
+
+dplot <- ggplot(meta_d_final, aes(x = type, y = est)) + geom_boxplot(outlier.shape = NA) + geom_hline(yintercept=0, alpha=0.5, linetype = "dashed") + geom_jitter(alpha = 0.75, shape = 18, size = 4, width = .35) + coord_flip() + scale_y_continuous(breaks = seq(-1, 1.75, by = 0.25)) + theme_pubr(base_size = 20) + theme(
+        text = element_text(family = "Gill Sans MT")
+    ) + rremove("legend") + xlab("")+ ylab("Effect Size")
+dplot 
+
+# Combine?
+figure <- ggpubr::ggarrange(bplot2, dplot,
+                    labels = c("", ""),
+                    ncol = 2, nrow = 1)
+
+ggsave("d_boxplot.png", dplot, height = 9, width = 14)
+
+
+#ggsave("combined_boxplot.png", figure, height = 9, width = 14)
+```
+
+### Subgroup Analysis
+```{r, Subgroup Analysis: ICC}
+
+# Non-longitudinal
+# ICC - subgroup
+meta_icc_table_within_L3 <- meta_icc_final %>% filter(type == "Between-units at level 3") %>% mutate(stud_var = paste0(Refid, dv_name)) %>% pivot_longer(c(`Measurement Approach`, `Outcome Type`, `Outcome Subtype`, cluster, var), names_to = "Characteristic", values_to = "Factor") %>% group_by(Characteristic, Factor) %>% 
+  dplyr::summarise(`M (SD)` = paste0( round(mean(est, na.rm = T), 2), " (", round(sd(est, na.rm = T), 2), ")") , 
+                    Min = round(min(est, na.rm = T), 2), 
+                    Max = round(max(est, na.rm = T), 2), 
+                   `Outcomes (Studies)` = paste0( n(), ' (',  studies = n_distinct(Refid), ')'))
+
+meta_icc_table_within_L2 <- meta_icc_final %>% filter(type == "Between-units at level 2") %>% mutate(stud_var = paste0(Refid, dv_name)) %>% pivot_longer(c(`Measurement Approach`, `Outcome Type`, `Outcome Subtype`,cluster, var), names_to = "Characteristic", values_to = "Factor") %>% group_by(Characteristic, Factor) %>% 
+  dplyr::summarise(`M (SD)` = paste0( round(mean(est, na.rm = T), 2), " (", round(sd(est, na.rm = T), 2), ")") , 
+                    Min = round(min(est, na.rm = T), 2), 
+                    Max = round(max(est, na.rm = T), 2), 
+                   `Outcomes (Studies)` = paste0( n(), ' (',  studies = n_distinct(Refid), ')'))
+
+# Longitudinal
+# ICC - subgroup
+meta_icc_table_long <- meta_icc_final %>% filter(type == "Longitudinal (Within-unit)") %>% mutate(stud_var = paste0(Refid, dv_name)) %>% pivot_longer(c(`Measurement Approach`, `Outcome Type`, `Outcome Subtype`,cluster, var), names_to = "Characteristic", values_to = "Factor") %>% group_by(Characteristic, Factor) %>% 
+  dplyr::summarise(`M (SD)` = paste0( round(mean(est, na.rm = T), 2), " (", round(sd(est, na.rm = T), 2), ")") , 
+                    Min = round(min(est, na.rm = T), 2), 
+                    Max = round(max(est, na.rm = T), 2),
+                   `Outcomes (Studies)` = paste0( n(), ' (',  studies = n_distinct(Refid), ')'))
+
+#write.csv(meta_icc_table_df, "/Users/nickcardamone/Desktop/icc_tabledf_long.csv", na = "")
+
+
+meta_icc_table_df <- full_join(meta_icc_table_within_L2, meta_icc_table_within_L3, suffix = c(".L2", ".L3"), by =c("Characteristic", "Factor"))
+
+
+meta_icc_table_df <- full_join(meta_icc_table_df, meta_icc_table_long, suffix  = c("", ".Long"), by = c("Characteristic", "Factor"))
+
+
+g <- gt( meta_icc_table_df , groupname_col = "Characteristic") |>
+  tab_spanner(
+    label = "Cross-sectional L3",
+    columns = ends_with("L3")
+  ) |>
+  tab_spanner(
+    label = "Cross-sectional L2",
+    columns = ends_with("L2")
+  ) |>
+  tab_spanner(
+    label = "Longitudinal (Within-unit)",
+    columns = ends_with("Long")
+  )
+
+
+
+write.csv(g, "icc_subgroup_table.csv", na = "")
+
+g
+```
+
+```{r, Subgroup Analysis: Effect size}
+library(gt)
+# Strategy set vs. lesser strategy set
+meta_d_table_strat <- meta_d_final %>% filter(type != "Comparative effectiveness") %>% mutate(stud_var = paste0(Refid, dv_name)) %>% pivot_longer(c(`Measurement.Approach`, `Outcome.Type`, `Outcome.Subtype`, var), names_to = "Characteristic", values_to = "Factor") %>% group_by(Characteristic, Factor) %>% 
+  dplyr::summarise(`M (SD)` = paste0( round(mean(est, na.rm = T), 2), " (", round(sd(est, na.rm = T), 2), ")") , 
+                    Min = round(min(est, na.rm = T), 2), 
+                    Max = round(max(est, na.rm = T), 2), 
+                   Contrasts = n(), 
+                   `Outcomes (Studies)` = paste0( n_distinct(stud_var), ' (',  studies = n_distinct(Refid), ')'))
+
+# Comparative effectiveness
+meta_d_table_ce <- meta_d_final %>% filter(type == "Comparative effectiveness") %>% mutate(stud_var = paste0(Refid, dv_name)) %>% pivot_longer(c(`Measurement.Approach`, `Outcome.Type`, `Outcome.Subtype`, var), names_to = "Characteristic", values_to = "Factor") %>% group_by(Characteristic, Factor) %>% 
+  dplyr::summarise(`M (SD)` = paste0( round(mean(est, na.rm = T), 2), " (", round(sd(est, na.rm = T), 2), ")") , 
+                    Min = round(min(est, na.rm = T), 2), 
+                    Max = round(max(est, na.rm = T), 2), 
+                   Contrasts = n(), 
+                   `Outcomes (Studies)` = paste0( n_distinct(stud_var), ' (',  studies = n_distinct(Refid), ')'))
+
+meta_d_table_df <- left_join(meta_d_table_strat, meta_d_table_ce, by = c("Characteristic", "Factor"))
+
+
+g <- gt( meta_d_table_df, groupname_col = "Characteristic") |>
+  tab_spanner(
+    label = "Standard vs. Standard + Enhanced Strategy (d)",
+    columns = ends_with(".x")
+  ) |>
+  tab_spanner(
+    label = "Comparative Effectiveness (|d|)",
+    columns = ends_with(".y")
+  ) 
+g
+
+write.csv(g, "d_subgroup_table.csv", na = "")
+```
+
+
+```{r, ICC Non-parametric Omnibus Tests}
+
+meta_icc_final <- meta_icc_final %>% mutate(`Study Type` = if_else(type2 == "Longitudinal", type, "Cross-sectional"))
+
+
+# Clinical vs. Implementation
+icc_p1 <- lapply(split(meta_icc_final, meta_icc_final$type2), function(d) { kruskal.test(est ~ `Outcome Type`, data=d) })
+# All outcome Subtypes different
+icc_p2 <- lapply(split(meta_icc_final, meta_icc_final$type2), function(d) { kruskal.test(est ~ `Outcome Subtype`, data=d) })
+# Measurement approach
+icc_p3 <- lapply(split(meta_icc_final, meta_icc_final$type2), function(d) { kruskal.test(est ~ `Measurement Approach`, data=d) })
+# Cluster
+icc_p4 <- lapply(split(subset(meta_icc_final, type2 != "Cross-sectional (L3)"), meta_icc_final$type2), function(d) { kruskal.test(est ~ cluster, data=d) })
+
+icc_pvals <- c(icc_p1$`Longitudinal (L2)`$p.value, icc_p2$`Longitudinal (L2)`$p.value, icc_p3$`Longitudinal (L2)`$p.value, icc_p4$`Longitudinal (L2)`$p.value,
+               icc_p1$`Cross-sectional (L2)`$p.value, icc_p2$`Cross-sectional (L2)`$p.value, icc_p3$`Cross-sectional (L2)`$p.value, icc_p4$`Cross-sectional (L2)`$p.value,
+               icc_p1$`Cross-sectional (L3)`$p.value, icc_p2$`Cross-sectional (L3)`$p.value, icc_p3$`Cross-sectional (L3)`$p.value 
+  )
+
+
+```
+
+
+
+```{r, Effect Size Subgroup Omnibus Test}
+# Wilcoxon rank sum test / Mann-Whitney 
+
+meta_d_final <- meta_d_final %>% mutate(`Study Type` = if_else(type == "Comparative effectiveness", type, "Standard vs. Standard + Enhanced"))
+
+
+# Clinical vs. Implementation
+d_pval1 <- lapply(split(meta_d_final, meta_d_final$`Study Type`), function(d) { kruskal.test(est ~ `Outcome.Type`, data=d) })
+
+# All outcome subtypes different
+d_pval2 <- lapply(split(meta_d_final, meta_d_final$`Study Type`), function(d) { kruskal.test(est ~ `Outcome.Subtype`, data=d) })
+
+# Measurement approach
+d_pval3 <- lapply(split(meta_d_final, meta_d_final$`Study Type`), function(d) { kruskal.test(est ~ `Measurement.Approach`, data=d) })
+
+
+d_pvals <- c(d_pval1$`Comparative effectiveness`$p.value, d_pval2$`Comparative effectiveness`$p.value,  d_pval3$`Comparative effectiveness`$p.value,
+             d_pval1$`Standard vs. Standard + Enhanced`$p.value, d_pval2$`Standard vs. Standard + Enhanced`$p.value, d_pval3$`Standard vs. Standard + Enhanced`$p.value)
+
+
+## All p-values
+
+all_pvals = c(icc_pvals, d_pvals)
+
+# Benjamini-Hochberg Correction
+np_df = data.frame(omnibus_p_vals = round(p.adjust(all_pvals, method = "BH"), 3))
+```
+
+
+
+### Moderator Analysis:
+* Linear mixed effect models
+* Effect size estimates are nested within outcome within study.
+* ICC estimates are nested within studies.
+* Pooled estimates are not weighted on variance.
+
+
+
+
+```{r, Longitudinal ICC Moderators}
+library(lme4)
+library(lmerTest)
+dat <- meta_icc_final %>% filter(type2 == 'Longitudinal (L2)')
+
+# Empty
+mod <- lmer(est ~ (1 | Refid/dv_name), data = dat)
+summary(mod)
+performance::icc(mod, by_group = T) 
+
+# Clinical vs. Implementation:
+mod <- lmer(est ~ 0 + `Outcome Type` + (1 | Refid), data = dat, REML = T)
+mod_coef <- coef(mod)
+mod <- as(mod,"merModLmerTest")
+mod %>% anova(mod,ddf="Satterthwaite")
+
+mod_vcov <- clubSandwich::vcovCR(mod, type = "CR2")
+coef_test(mod, vcov = mod_vcov)
+index <- ncol(mod_vcov)
+clubSandwich::Wald_test(mod, vcov = mod_vcov, 
+                        constraints = constrain_equal(1:index))
+
+mod
+# Outcome Subtype:
+mod <- lmer(est ~ 0 + `Outcome Subtype` + (1 | Refid), data = dat)
+mod_coef <- coef(mod)
+mod_vcov <- clubSandwich::vcovCR(mod, type = "CR2")
+coef_test(mod, vcov = mod_vcov)
+index <- ncol(mod_vcov)
+clubSandwich::Wald_test(mod, vcov = mod_vcov, 
+                        constraints = constrain_equal(1:index))
+
+# Measurement Approach:
+
+mod <- lmer(est ~ 0 + `Measurement Approach` + (1 | Refid), data = dat)
+mod_coef <- coef(mod)
+mod_vcov <- clubSandwich::vcovCR(mod, type = "CR2")
+coef_test(mod, vcov = mod_vcov)
+index <- ncol(mod_vcov)
+clubSandwich::Wald_test(mod, vcov = mod_vcov, 
+                        constraints = constrain_equal(1:index))
+
+# Cluster:
+
+mod <- lmer(est ~ 0 + cluster + (1 | Refid), data = dat)
+mod_coef <- coef(mod)
+mod_vcov <- clubSandwich::vcovCR(mod, type = "CR2")
+coef_test(mod, vcov = mod_vcov)
+index <- ncol(mod_vcov)
+clubSandwich::Wald_test(mod, vcov = mod_vcov, 
+                        constraints = constrain_equal(1:index))
+
+## ICC is 0.8596
+```
+
+
+```{r, Cross-sectional (L2) ICC Moderators}
+dat <- meta_icc_final %>% filter(type2 == 'Cross-sectional (L2)')
+
+# Empty
+mod <- lmer(est ~ (1 | Refid/dv_name), data = dat)
+summary(mod)
+performance::icc(mod, by_group = T) 
+
+# Clinical vs. Implementation:
+mod <- lmer(est ~ 0 + `Outcome Type` + (1 | Refid), data = dat)
+mod_coef <- coef(mod)
+mod_vcov <- clubSandwich::vcovCR(mod, type = "CR2")
+coef_test(mod, vcov = mod_vcov)
+index <- ncol(mod_vcov)
+clubSandwich::Wald_test(mod, vcov = mod_vcov, 
+                        constraints = constrain_equal(1:index))
+
+# Outcome Subtype:
+mod <- lmer(est ~ 0 + `Outcome Subtype` + (1 | Refid), data = dat)
+mod_coef <- coef(mod)
+mod_vcov <- clubSandwich::vcovCR(mod, type = "CR2")
+coef_test(mod, vcov = mod_vcov)
+index <- ncol(mod_vcov)
+clubSandwich::Wald_test(mod, vcov = mod_vcov, 
+                        constraints = constrain_equal(1:index))
+
+# Measurement Approach:
+
+mod <- lmer(est ~ 0 + `Measurement Approach` + (1 | Refid), data = dat)
+mod_coef <- coef(mod)
+mod_vcov <- clubSandwich::vcovCR(mod, type = "CR2")
+coef_test(mod, vcov = mod_vcov)
+index <- ncol(mod_vcov)
+clubSandwich::Wald_test(mod, vcov = mod_vcov, 
+                        constraints = constrain_equal(1:index))
+
+# Cluster:
+
+mod <- lmer(est ~ 0 + cluster + (1 | Refid), data = dat)
+mod_coef <- coef(mod)
+mod_vcov <- clubSandwich::vcovCR(mod, type = "CR2")
+coef_test(mod, vcov = mod_vcov)
+index <- ncol(mod_vcov)
+clubSandwich::Wald_test(mod, vcov = mod_vcov, 
+                        constraints = constrain_equal(1:index))
+
+### ICC is 0.34
+
+```
+
+```{r, Cross-sectional (L2) ICC Moderators}
+dat <- meta_icc_final %>% filter(type2 == 'Cross-sectional (L3)')
+
+# Empty
+mod <- lmer(est ~ (1 | Refid/dv_name), data = dat)
+summary(mod)
+performance::icc(mod, by_group = T) 
+
+# Clinical vs. Implementation:
+mod <- lmer(est ~ 0 + `Outcome Subtype` + (1 | Refid), data = dat, REML = T)
+mod <- as(mod,"merModLmerTest")
+mod %>% summary(ddf="Kenward-Roger")
+mod %>% anova(ddf="Kenward-Roger")
+
+# Outcome Subtype:
+mod <- lmer(est ~ 0 + `Outcome Subtype` + (1 | Refid), data = dat)
+mod_coef <- coef(mod)
+mod_vcov <- clubSandwich::vcovCR(mod, type = "CR2")
+coef_test(mod, vcov = mod_vcov)
+#index <- ncol(mod_vcov)
+#clubSandwich::Wald_test(mod, vcov = mod_vcov, 
+#                        constraints = constrain_equal(1:index))
+
+# Measurement Approach:
+
+mod <- lmer(est ~ 0 + `Measurement Approach` + (1 | Refid), data = dat)
+mod_coef <- coef(mod)
+mod_vcov <- clubSandwich::vcovCR(mod, type = "CR2")
+coef_test(mod, vcov = mod_vcov)
+index <- ncol(mod_vcov)
+clubSandwich::Wald_test(mod, vcov = mod_vcov, 
+                        constraints = constrain_equal(1:index))
+
+# Cluster: No point because there's only one contrast
+
+## ICC is 0.2888
+
+```
+
+```{r, Standard vs. Standard + Enhanced Effect Size Moderators}
+# Use lme4::lmer and clubSandwich
+dat <- meta_d_final %>% filter(`Study Type` == 'Standard vs. Standard + Enhanced')
+
+# Empty
+mod <- lmer(est ~ (1 | Refid/dv_name), data = dat)
+summary(mod)
+performance::icc(mod, by_group = T) 
+
+# Clinical vs. Implementation:
+mod <- lmer(est ~ 0 + `Outcome.Type` + (1 | Refid/dv_name), data = dat)
+mod_coef <- coef(mod)
+mod_vcov <- clubSandwich::vcovCR(mod, type = "CR2")
+coef_test(mod, vcov = mod_vcov)
+index <- ncol(mod_vcov)
+clubSandwich::Wald_test(mod, vcov = mod_vcov, 
+                        constraints = constrain_equal(1:index))
+
+# Outcome Subtype:
+mod <- lmer(est ~ 0 + `Outcome.Subtype` + (1 | Refid/dv_name), data = dat)
+mod_coef <- coef(mod)
+mod_vcov <- clubSandwich::vcovCR(mod, type = "CR2")
+coef_test(mod, vcov = mod_vcov)
+index <- ncol(mod_vcov)
+clubSandwich::Wald_test(mod, vcov = mod_vcov, 
+                        constraints = constrain_equal(1:index))
+
+# Measurement Approach:
+
+mod <- lmer(est ~ 0 + `Measurement.Approach` + (1 | Refid/dv_name), data = dat)
+mod_coef <- coef(mod)
+mod_vcov <- clubSandwich::vcovCR(mod, type = "CR2")
+coef_test(mod, vcov = mod_vcov)
+index <- ncol(mod_vcov)
+clubSandwich::Wald_test(mod, vcov = mod_vcov, 
+                        constraints = constrain_equal(1:index))
+
+## ICC of Study: 0.3176
+## ICC of Outcome: 7.01251254e-8
+```
+
+
+```{r, Comparative Effectiveness Moderators}
+library(performance) 
+dat <- meta_d_final %>% filter(`Study Type` == 'Comparative effectiveness')
+
+# Empty
+mod <- lmer(est ~ (1 | Refid/dv_name), data = dat)
+summary(mod)
+performance::icc(mod, by_group = T)
+
+# Clinical vs. Implementation:
+mod <- lmer(est ~ 0 + `Outcome.Type` + (1 | Refid/dv_name), data = dat)
+mod_coef <- coef(mod)
+mod_vcov <- clubSandwich::vcovCR(mod, type = "CR2")
+coef_test(mod, vcov = mod_vcov)
+index <- ncol(mod_vcov)
+clubSandwich::Wald_test(mod, vcov = mod_vcov, 
+                        constraints = constrain_equal(1:index))
+
+# Outcome Subtype:
+mod <- lmer(est ~ 0 + `Outcome.Subtype` + (1 | Refid/dv_name), data = dat)
+mod_coef <- coef(mod)
+mod_vcov <- clubSandwich::vcovCR(mod, type = "CR2")
+coef_test(mod, vcov = mod_vcov)
+index <- ncol(mod_vcov)
+clubSandwich::Wald_test(mod, vcov = mod_vcov, 
+                        constraints = constrain_equal(1:index))
+
+# Measurement Approach:
+
+mod <- lmer(est ~ 0 + `Measurement.Approach` + (1 | Refid/dv_name), data = dat)
+mod_coef <- coef(mod)
+mod_vcov <- clubSandwich::vcovCR(mod, type = "CR2")
+coef_test(mod, vcov = mod_vcov)
+index <- ncol(mod_vcov)
+clubSandwich::Wald_test(mod, vcov = mod_vcov, 
+                        constraints = constrain_equal(1:index))
+
+## ICC of Study: 0.287
+## ICC of Outcome: 0.659
+
+```
+
+### Covariate R-Squared Summary Statistics
+
+```{r, Proportion of Variance Explained by Outcome - Reduced and Full Model}
+
+## Pivot proportion of variance explained by covaraite estimate type
+meta_r2_final_long <- meta_r2_final %>% mutate(varid = as.factor(as.numeric(as.factor(dv_name))),
+                                               `Demographic-only` = demo_est,
+                                               `Pretest-only` = pretest_est,
+                                               `Demographic and Pretest` = demo_pretest_est,
+                                               `Full PVE` = full_est,
+                                               model = if_else(is.na(`Demographic-only`), "Treatment + Pretest-only",
+                             if_else(is.na(`Pretest-only`), "Treatment + Demographic-only", "Treatment + Pretest + Demographic"))) %>% pivot_longer(c(`Demographic-only`, `Pretest-only`, `Demographic and Pretest`), names_to = "Covariate Type", values_to = "Reduced PVE")
+
+#meta_r2_final_long <- meta_r2_final_long %>% filter(`Reduced PVE` >= 0)
+meta_r2_final_long <- meta_r2_final_long %>% mutate(`Reduced PVE`= if_else(`Reduced PVE` < 0, 0, `Reduced PVE`))
+
+#write.csv("meta_r2_final_long.csv", meta_r2_final_long)
+
+
+```
+```{r}
+
+#meta_r2_final_long <- meta_r2_final_long %>% filter(`Full PVE` > 0)
+
+meta_r2_final_long$type <- factor(meta_r2_final_long$type, levels = c('Level 3', 'Level 2', 'Level 1'), ordered = F)
+
+
+meta_r2_final_long <- meta_r2_final_long %>% drop_na(`Reduced PVE`)
+meta_r2_final_long$`Covariate Type` <- factor(meta_r2_final_long$`Covariate Type`, levels = c('Demographic and Pretest', 'Pretest-only', 'Demographic-only'), ordered = F)
+
+covplot_byoutcome <- ggplot( meta_r2_final_long ) + geom_hline(yintercept=0, alpha=0.5, linetype = "dashed") +
+  geom_segment(aes(x =varid, xend = varid, y = `Reduced PVE`, yend = `Full PVE`), color = "grey", arrow = arrow()) +
+  geom_point(aes(x =varid, y = `Reduced PVE`), color = rgb(0.7,0.2,0.1,0.5), size=3 ) +
+  geom_point(aes(x =varid, y = `Full PVE`),color = rgb(0.2,0.7,0.1,0.5), size=3 ) +
+  coord_flip() +
+  facet_grid2(scales = "free_y",
+  rows = vars(type, `Covariate Type`),
+  strip = strip_nested(bleed = F)) +
+  xlab("Sample") + ylab("Estimate Proportion of Variance Explained Explained by Covariates") + 
+  theme(legend.position = "none") + 
+  ggpubr::theme_pubr(base_size = 15)
+
+covplot_byoutcome
+ggsave("covplot_byoutcome.png", covplot_byoutcome, height =12, width = 10)
+
+
+```
+```{r, Proportion of Covariates Explained Collapsed Dot Plot}
+meta_r2_final_long$`Covariate Type` <- factor(meta_r2_final_long$`Covariate Type`, levels = c('Demographic-only', 'Pretest-only', 'Demographic and Pretest'), ordered = F)
+
+## Total
+
+covplot_boxplot <- 
+  ggplot( meta_r2_final_long ) + 
+  geom_hline(yintercept=0, alpha=0.5, linetype = "dashed") +
+  geom_boxplot(aes(x =`Covariate Type`, y = `Reduced PVE`)) +
+  coord_flip() +
+  facet_grid2(scales = "free_y",
+  rows = vars(type),
+  strip = strip_nested(bleed = F)
+) +
+  xlab("Outcome ID") + ylab("Estimate Proportion of Variance Explained Explained by Covariates") + 
+  theme(
+    legend.position = "none",
+  ) + ggpubr::theme_pubr(base_size = 15)
+
+covplot_boxplot
+
+
+meta_r2_final_long_bplot <- meta_r2_final_long %>% group_by(type, `Covariate Type`) %>% summarize(`Reduced PVE` = mean(`Reduced PVE`), 
+                                                                                 `Full PVE` = mean(`Full PVE`),
+                                                                                 Observations =n())
+covplot_total <- 
+  ggplot( meta_r2_final_long_bplot ) + 
+  geom_hline(yintercept=0, alpha=0.5, linetype = "dashed") +
+  geom_segment(aes(x =`Covariate Type`, xend = `Covariate Type`, y = `Reduced PVE`, yend = `Full PVE`), color = "grey") +
+  geom_point(aes(x =`Covariate Type`, y = `Reduced PVE`), color = rgb(0.7,0.2,0.1,0.5), size=3 ) +
+  geom_point(aes(x =`Covariate Type`, y = `Full PVE`), color = rgb(0.2,0.7,0.1,0.5), size=3 ) +
+  coord_flip() +
+  facet_grid2(scales = "free_y",
+  rows = vars(type),
+  strip = strip_nested(bleed = F)
+) +
+  xlab("Outcome ID") + ylab("Estimate Proportion of Variance Explained Explained by Covariates") + 
+  theme(
+    legend.position = "none",
+  ) + ggpubr::theme_pubr(base_size = 15)
+
+covplot_total
+
+covplot_reduced_only <- 
+  ggplot( meta_r2_final_long_bplot ) + 
+  geom_hline(yintercept=0, alpha=0.5, linetype = "dashed") +
+  geom_segment(aes(x =`Covariate Type`, xend = `Covariate Type`, y = 0, yend = `Reduced PVE`), color = "grey") +
+  geom_point(aes(x =`Covariate Type`, y = `Reduced PVE`, size =Observations), color = "black", size=3 ) +
+  coord_flip() +
+  facet_grid2(scales = "free_y",
+  rows = vars(type),
+  strip = strip_nested(bleed = F)
+) +
+  xlab("Covariate Type") + ylab("Estimate Proportion of Variance Explained Explained by Covariates") + 
+  theme(
+    legend.position = "none",
+  ) + ggpubr::theme_pubr(base_size = 15)
+
+covplot_reduced_only
+
+
+ggsave("cov_plot_boxplot.png", covplot_boxplot, height =12, width = 10)
+
+```
+
+```{r, Proportion of Variance Explained by Covariates Descriptive Statistics}
+meta_r2_final_long$type <- factor(meta_r2_final_long$type, levels = c('Level 1', 'Level 2', 'Level 3'), ordered = F)
+
+meta_r2_final_distinct <- meta_r2_final_long %>% filter(`Reduced PVE` != 0.1040065568)
+
+covplot_boxplot <- 
+  ggplot( meta_r2_final_distinct ) + 
+  geom_hline(yintercept=0, alpha=0.5, linetype = "dashed") +
+  geom_boxplot(aes(x =type, y = `Reduced PVE`)) +
+  coord_flip() +
+  xlab("Level") + ylab("Estimate Proportion of Variance Explained Explained by Covariates") + 
+  theme(
+    legend.position = "none",
+  ) + ggpubr::theme_pubr(base_size = 15)
+
+covplot_boxplot
+
+
+meta_r2_final_long$`Covariate Type` <- factor(meta_r2_final_long$`Covariate Type`, levels = c('Demographic-only', 'Pretest-only', 'Demographic and Pretest'), ordered = T)
+meta_r2_final_long$cov_num <- as.numeric(meta_r2_final_long$`Covariate Type`)
+
+
+meta_r2_final_long$type <- factor(meta_r2_final_long$type, levels = c('Level 3', 'Level 2', 'Level 1'), ordered = F)
+
+# How many outcomes total?
+meta_r2_final %>% select(Refid, dv_name) %>% distinct() 
+
+# Level by Covariate Type
+r2_sum_stats = meta_r2_final_long %>% group_by(type, `Covariate Type`) %>% 
+  dplyr::summarise(
+    `N Outcomes` = n(),
+    `N Studies` = n_distinct(Refid),
+    `Mean` = round(mean(`Reduced PVE`, na.rm = TRUE), 3),
+    `SD` = round(sd(`Reduced PVE`, na.rm = TRUE), 3),
+    `Median` = round(median(`Reduced PVE`, na.rm = TRUE), 3),
+    `Bottom Quartile` = round(quantile(`Reduced PVE`, probs = c(0.25), na.rm = T), 3),
+    `Upper Quartile` = round(quantile(`Reduced PVE`, probs = c(0.75), na.rm = T), 3),
+    `IQR` = round(IQR(`Reduced PVE`), 3)
+  ) %>% gt() |>
+  tab_spanner(
+    label = "Reduced Model",
+    columns = everything()
+  )
+r2_sum_stats
+
+
+# Pretest only
+r2_sum_stats = meta_r2_final_long %>% group_by(type) %>% filter(`Covariate Type` == 'Pretest-only') %>% 
+  dplyr::summarise(
+    `N Outcomes` = n(),
+    `N Studies` = n_distinct(Refid),
+    `Mean` = round(mean(`Reduced PVE`, na.rm = TRUE), 3),
+    `SD` = round(sd(`Reduced PVE`, na.rm = TRUE), 3),
+    `Median` = round(median(`Reduced PVE`, na.rm = TRUE), 3),
+    `Bottom Quartile` = round(quantile(`Reduced PVE`, probs = c(0.25), na.rm = T), 3),
+    `Upper Quartile` = round(quantile(`Reduced PVE`, probs = c(0.75), na.rm = T), 3),
+    `IQR` = round(IQR(`Reduced PVE`), 3)
+  ) %>% gt() |>
+  tab_spanner(
+    label = "Reduced Model",
+    columns = everything()
+  )
+r2_sum_stats
+# Demorgaphic only
+r2_sum_stats = meta_r2_final_long %>% group_by(type) %>% filter(`Covariate Type` == 'Demographic-only') %>% 
+  dplyr::summarise(
+    `N Outcomes` = n(),
+    `N Studies` = n_distinct(Refid),
+    `Mean` = round(mean(`Reduced PVE`, na.rm = TRUE), 3),
+    `SD` = round(sd(`Reduced PVE`, na.rm = TRUE), 3),
+    `Median` = round(median(`Reduced PVE`, na.rm = TRUE), 3),
+    `Bottom Quartile` = round(quantile(`Reduced PVE`, probs = c(0.25), na.rm = T), 3),
+    `Upper Quartile` = round(quantile(`Reduced PVE`, probs = c(0.75), na.rm = T), 3),
+    `IQR` = round(IQR(`Reduced PVE`), 3)
+  ) %>% gt() |>
+  tab_spanner(
+    label = "Reduced Model",
+    columns = everything()
+  )
+
+r2_sum_stats
+
+meta_r2_final_long <- meta_r2_final_long %>% group_by(Refid, dv_name, type) %>% slice_max(cov_num, with_ties = T)
+
+# Take Pretest + Demographic, Pretest, then Demographic (if they don't have Pretest).
+r2_sum_stats = meta_r2_final_long %>% group_by(type) %>%
+  dplyr::summarise(
+    `N Outcomes` = n(),
+    `N Studies` = n_distinct(Refid),
+    `Mean` = round(mean(`Reduced PVE`, na.rm = TRUE), 3),
+    `SD` = round(sd(`Reduced PVE`, na.rm = TRUE), 3),
+    `Median` = round(median(`Reduced PVE`, na.rm = TRUE), 3),
+    `Bottom Quartile` = round(quantile(`Reduced PVE`, probs = c(0.25), na.rm = T), 3),
+    `Upper Quartile` = round(quantile(`Reduced PVE`, probs = c(0.75), na.rm = T), 3),
+    `IQR` = round(IQR(`Reduced PVE`), 3)
+  ) %>% gt() |>
+  tab_spanner(
+    label = "Reduced Model",
+    columns = everything()
+  )
+r2_sum_stats
+write.csv(r2_sum_stats, "r2_sum_stats.csv")
+
+```
+
+## Vignettes
+
+```{r}
+library(WebPower)
+
+# Standard vs. Standard + Enhanced
+
+wp.crt2arm(f=0.54, n=4, icc=.68, alpha=0.05, power=0.80, alternative="two.sided")
+#wp.crt2arm(f=0.33, n = seq(20, 100, 10), J=30, icc=.15, alpha=0.05, alternative="two.sided")
+
+
+#wp.crt2arm(f=0.33, J=20, icc=.44, alpha=0.05, power=0.80, alternative="two.sided")
+
+```
+```{r}
+library(longpower)
+
+library(lme4)
+lmmpower(fm1, pct.change = 0.30, t = seq(0,1,2,3,4), power = 0.80)
+
+```
+```{r}
+library(pwr)
+
+ICC <- 0.44
+DE <- 1 + (4 - 1) * ICC
+
+ES <- 0.77
+SES <- ES / sqrt(DE)
+
+n <- pwr::pwr.f2.test(u = SES, v = 1, f2 = NULL, sig.level = 0.05, power = 0.8, alternative = "greater")
+
+
+```
+
+### Further reading:
+* https://www.ncbi.nlm.nih.gov/pmc/articles/PMC9559079/ "there is in fact no gain in statistical power with MLM when data are balanced."
+The cost of multilevel modeling: "Singular fit errors were more frequent when intra-class correlation (ICC) was low (i.e., the majority of total variance is due to within-group variance) than when ICC was higher (i.e., more total variance is attributed to between-group variance). This was especially evident when sample size was small - singular fits occurred in over 20% of models when the ICC was 0.1"
+* Forms of ICC: https://www.ncbi.nlm.nih.gov/pmc/articles/PMC4913118/
+* Downstream clustering: https://www.tandfonline.com/doi/abs/10.1080/00220973.2020.1783501
+* Cluster-robust inference: A general workflow for complex meta-analyses with dependent effect sizes, Wolfgang Viechtbauer
+* Constraints during Wald Tests: https://cran.r-project.org/web/packages/clubSandwich/vignettes/Wald-tests-in-clubSandwich.html
+* https://powerupr.shinyapps.io/index/
+
+
+### References:
+
+Feingold, A. (2013). A regression framework for effect size assessments in longitudinal modeling of group differences. Review of General Psychology, 17(1), 111-121.
+
+
+
+
+
